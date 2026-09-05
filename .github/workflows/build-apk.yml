@@ -1,10 +1,14 @@
-name: Build X Dubbing Studio APK
+name: Universal Android ZIP Builder v7
 
 on:
   workflow_dispatch:
   push:
-    branches:
-      - main
+    branches: [ main, master ]
+    paths:
+      - '**/*.zip'
+      - '**/*.gradle'
+      - '**/*.gradle.kts'
+      - '.github/workflows/build-apk.yml'
 
 permissions:
   contents: read
@@ -12,71 +16,142 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
       - name: Set up JDK 17
-        uses: actions/setup-java@v5
+        uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
 
-      - name: Extract clean project
-        shell: bash
-name: Build X Dubbing Studio APK
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
 
-on:
-  workflow_dispatch:
-  push:
-    branches:
-      - main
-
-permissions:
-  contents: read
-
-jobs:
-  build:
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up JDK 17
-        uses: actions/setup-java@v5
-        with:
-          distribution: temurin
-          java-version: '17'
-
-      - name: Extract clean project
+      - name: Install Android platform 35
         shell: bash
         run: |
-          set -euxo pipefail
-          rm -rf build_source
-          mkdir -p build_source
+          set -euo pipefail
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager "platform-tools" "platforms;android-35" "build-tools;35.0.0"
 
-          ZIP_FILE="$(find . -maxdepth 2 -type f -iname '*.zip' | head -1)"
-          test -n "$ZIP_FILE"
-
-          echo "Using ZIP: $ZIP_FILE"
-          unzip -q "$ZIP_FILE" -d build_source
-
-      - name: Detect project directory
+      - name: Prepare and extract ZIP projects
         shell: bash
         run: |
-          set -euxo pipefail
+          set -euo pipefail
+          python3 <<'PY'
+          from pathlib import Path
+          import os, zipfile, shutil
 
-          PROJECT_DIR="$(find build_source -type f \( -name settings.gradle -o -name settings.gradle.kts \) -printf '%h\n' | head -1)"
-          test -n "$PROJECT_DIR"
+          repo = Path(os.environ['GITHUB_WORKSPACE']).resolve()
+          work = Path(os.environ['RUNNER_TEMP']) / 'android_projects'
+          shutil.rmtree(work, ignore_errors=True)
+          work.mkdir(parents=True, exist_ok=True)
 
-          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
-          echo "Android project: $PROJECT_DIR"
+          # Keep a copy of the checked-out repo as candidate 000, so this also
+          # works when the Android project is uploaded already extracted.
+          extracted_repo = work / '000_repo'
+          shutil.copytree(repo, extracted_repo, ignore=shutil.ignore_patterns('.git'))
 
-      - name: Set up Gradle 8.9
+          zip_files = [p for p in repo.rglob('*.zip') if '.git' not in p.parts]
+          print(f'ZIP files found: {len(zip_files)}')
+
+          def safe_extract(zpath: Path, dest: Path):
+              dest.mkdir(parents=True, exist_ok=True)
+              base = dest.resolve()
+              with zipfile.ZipFile(zpath) as zf:
+                  for info in zf.infolist():
+                      target = (dest / info.filename).resolve()
+                      if os.path.commonpath([str(base), str(target)]) != str(base):
+                          raise RuntimeError(f'Unsafe ZIP entry blocked: {info.filename}')
+                  zf.extractall(dest)
+              print('Extracted:', zpath, '->', dest)
+
+          roots = [extracted_repo]
+          for i, z in enumerate(zip_files, 1):
+              dest = work / f'{i:03d}_{z.stem}'
+              safe_extract(z, dest)
+              roots.append(dest)
+
+          # Nested ZIP support, max 5 passes.
+          seen = set()
+          for depth in range(5):
+              nested = []
+              for root in list(roots):
+                  for z in root.rglob('*.zip'):
+                      key = str(z.resolve())
+                      if key not in seen:
+                          seen.add(key)
+                          nested.append(z)
+              if not nested:
+                  break
+              created = []
+              for n, z in enumerate(nested, 1):
+                  dest = z.parent / f'__unzipped_{depth+1}_{n}_{z.stem}'
+                  if dest.exists():
+                      continue
+                  safe_extract(z, dest)
+                  created.append(dest)
+              roots.extend(created)
+          PY
+
+      - name: Detect Android project directory
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          from pathlib import Path
+          import os
+
+          work = Path(os.environ['RUNNER_TEMP']) / 'android_projects'
+          candidates = []
+
+          settings_files = list(work.rglob('settings.gradle')) + list(work.rglob('settings.gradle.kts'))
+          for settings in settings_files:
+              root = settings.parent
+              score = 0
+              if (root / 'gradlew').exists(): score += 100
+              if (root / 'gradle/wrapper/gradle-wrapper.jar').exists(): score += 60
+              if (root / 'build.gradle').exists() or (root / 'build.gradle.kts').exists(): score += 30
+              if (root / 'app/build.gradle').exists() or (root / 'app/build.gradle.kts').exists(): score += 50
+
+              android_markers = []
+              for f in list(root.rglob('build.gradle')) + list(root.rglob('build.gradle.kts')):
+                  try:
+                      txt = f.read_text(errors='ignore')
+                  except Exception:
+                      continue
+                  if any(x in txt for x in ('com.android.application','com.android.library','com.android.dynamic-feature')):
+                      android_markers.append(f)
+
+              if android_markers:
+                  score += 250
+                  # Prefer shallower roots when scores tie.
+                  candidates.append((score, -len(root.parts), root, android_markers[0]))
+
+          if not candidates:
+              print('ERROR: No Android Gradle project found.')
+              print('Extracted tree (first 250 entries):')
+              for i, p in enumerate(sorted(work.rglob('*'))):
+                  if i >= 250: break
+                  try: print(p.relative_to(work))
+                  except Exception: pass
+              raise SystemExit(1)
+
+          candidates.sort(reverse=True, key=lambda x:(x[0],x[1]))
+          score, _, root, marker = candidates[0]
+          print('Selected project:', root)
+          print('Android marker:', marker)
+          print('Detection score:', score)
+
+          with open(os.environ['GITHUB_ENV'],'a') as f:
+              f.write(f'PROJECT_DIR={root}\n')
+          PY
+
+      - name: Set up fallback Gradle 8.9
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.9'
@@ -84,55 +159,45 @@ jobs:
       - name: Build debug APK
         shell: bash
         run: |
-          set -euxo pipefail
+          set -euo pipefail
           cd "$PROJECT_DIR"
-          gradle assembleDebug --stacktrace --no-daemon
+          echo "Building: $PROJECT_DIR"
 
-      - name: Find APK
+          if [ -f gradlew ] && [ -f gradle/wrapper/gradle-wrapper.jar ]; then
+            chmod +x gradlew
+            ./gradlew assembleDebug --stacktrace --no-daemon
+          else
+            gradle assembleDebug --stacktrace --no-daemon
+          fi
+
+      - name: Collect APK files
         shell: bash
         run: |
-          set -euxo pipefail
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/apk_artifacts"
+          rm -rf "$OUT"
+          mkdir -p "$OUT"
 
-          APK_PATH="$(find "$PROJECT_DIR" -type f -path '*/build/outputs/apk/debug/*.apk' | head -1)"
-          test -n "$APK_PATH"
+          mapfile -t APKS < <(find "$PROJECT_DIR" -type f -name '*.apk' -path '*/build/outputs/apk/*' ! -name '*androidTest*.apk' -print)
+          if [ "${#APKS[@]}" -eq 0 ]; then
+            echo "ERROR: No APK found after build."
+            find "$PROJECT_DIR" -type f -name '*.apk' -print || true
+            exit 1
+          fi
 
-          echo "APK_PATH=$APK_PATH" >> "$GITHUB_ENV"
-          echo "APK found: $APK_PATH"
+          i=0
+          for apk in "${APKS[@]}"; do
+            i=$((i+1))
+            cp "$apk" "$OUT/${i}_$(basename "$apk")"
+            echo "Collected: $apk"
+          done
+          echo "APK_OUTPUT_DIR=$OUT" >> "$GITHUB_ENV"
 
-      - name: Upload APK
+      - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
-          name: X-Dubbing-Studio-v2-debug-APK
-          path: ${{ env.APK_PATH }}
+          name: MarketOS-Android-APKs
+          path: ${{ env.APK_OUTPUT_DIR }}/*.apk
           if-no-files-found: error
-IR"
-
-      - name: Set up Gradle 8.9
-        uses: gradle/actions/setup-gradle@v4
-        with:
-          gradle-version: '8.9'
-
-      - name: Build debug APK
-        shell: bash
-        run: |
-          set -euxo pipefail
-          cd "$PROJECT_DIR"
-          gradle assembleDebug --stacktrace --no-daemon
-
-      - name: Find APK
-        shell: bash
-        run: |
-          set -euxo pipefail
-
-          APK_PATH="$(find "$PROJECT_DIR" -type f -path '*/build/outputs/apk/debug/*.apk' | head -1)"
-          test -n "$APK_PATH"
-
-          echo "APK_PATH=$APK_PATH" >> "$GITHUB_ENV"
-          echo "APK found: $APK_PATH"
-
-      - name: Upload APK
-        uses: actions/upload-artifact@v4
-        with:
-          name: X-Dubbing-Studio-v2-debug-APK
-          path: ${{ env.APK_PATH }}
-          if-no-files-found: error
+          retention-days: 14
+          
