@@ -1,12 +1,10 @@
-name: Auto Build Android APK from ZIP
+name: Build X Dubbing Studio APK
 
 on:
   workflow_dispatch:
   push:
-    branches: [ "main", "master" ]
-    paths:
-      - "**/*.zip"
-      - ".github/workflows/build-apk.yml"
+    branches:
+      - main
 
 permissions:
   contents: read
@@ -14,203 +12,68 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 30
 
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Java 17
-        uses: actions/setup-java@v4
+      - name: Set up JDK 17
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
-          java-version: "17"
+          java-version: '17'
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
-
-      - name: Install unzip tools
+      - name: Extract clean project
         shell: bash
         run: |
-          set -euo pipefail
-          sudo apt-get update -y
-          sudo apt-get install -y unzip zip
+          set -euxo pipefail
+          rm -rf build_source
+          mkdir -p build_source
 
-      - name: Set up fallback Gradle 8.11.1
+          ZIP_FILE="$(find . -maxdepth 2 -type f -iname '*.zip' | head -1)"
+          test -n "$ZIP_FILE"
+
+          echo "Using ZIP: $ZIP_FILE"
+          unzip -q "$ZIP_FILE" -d build_source
+
+      - name: Detect project directory
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          PROJECT_DIR="$(find build_source -type f \( -name settings.gradle -o -name settings.gradle.kts \) -printf '%h\n' | head -1)"
+          test -n "$PROJECT_DIR"
+
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+          echo "Android project: $PROJECT_DIR"
+
+      - name: Set up Gradle 8.9
         uses: gradle/actions/setup-gradle@v4
         with:
-          gradle-version: "8.11.1"
+          gradle-version: '8.9'
 
-      - name: Discover and safely extract every ZIP
-        id: extract
+      - name: Build debug APK
         shell: bash
         run: |
-          set -euo pipefail
+          set -euxo pipefail
+          cd "$PROJECT_DIR"
+          gradle assembleDebug --stacktrace --no-daemon
 
-          ROOT="$GITHUB_WORKSPACE"
-          EXTRACT_ROOT="$ROOT/_auto_extracted"
-          mkdir -p "$EXTRACT_ROOT"
-
-          mapfile -d '' INITIAL_ZIPS < <(find "$ROOT" \
-            -path "$ROOT/.git" -prune -o \
-            -path "$EXTRACT_ROOT" -prune -o \
-            -type f -iname '*.zip' -print0)
-
-          if [ "${#INITIAL_ZIPS[@]}" -eq 0 ]; then
-            echo "No ZIP files were found in the repository."
-            exit 1
-          fi
-
-          echo "Found ${#INITIAL_ZIPS[@]} ZIP file(s)."
-
-          # Extract initial ZIPs. Each ZIP gets its own directory.
-          idx=0
-          for zipfile in "${INITIAL_ZIPS[@]}"; do
-            idx=$((idx+1))
-            base="$(basename "$zipfile" .zip | tr -cs 'A-Za-z0-9._-' '_')"
-            dest="$EXTRACT_ROOT/${idx}_${base}"
-            mkdir -p "$dest"
-
-            # Basic ZIP-slip protection: reject absolute paths and ../ traversal.
-            if unzip -Z1 "$zipfile" | grep -Eq '(^/|(^|/)\.\.(/|$))'; then
-              echo "Unsafe ZIP path detected: $zipfile"
-              exit 1
-            fi
-
-            echo "Extracting: $zipfile -> $dest"
-            unzip -q -o "$zipfile" -d "$dest"
-          done
-
-          # Also unpack ZIPs nested inside extracted archives, up to 4 levels.
-          for depth in 1 2 3 4; do
-            mapfile -d '' NESTED < <(find "$EXTRACT_ROOT" -type f -iname '*.zip' -print0)
-            [ "${#NESTED[@]}" -eq 0 ] && break
-
-            changed=0
-            for nested in "${NESTED[@]}"; do
-              marker="${nested}.auto_extracted_done"
-              [ -f "$marker" ] && continue
-
-              if unzip -Z1 "$nested" | grep -Eq '(^/|(^|/)\.\.(/|$))'; then
-                echo "Unsafe nested ZIP path detected: $nested"
-                exit 1
-              fi
-
-              ndest="${nested%.zip}_unzipped"
-              mkdir -p "$ndest"
-              echo "Nested ZIP depth $depth: $nested -> $ndest"
-              unzip -q -o "$nested" -d "$ndest"
-              touch "$marker"
-              changed=1
-            done
-
-            [ "$changed" -eq 0 ] && break
-          done
-
-          echo "extract_root=$EXTRACT_ROOT" >> "$GITHUB_OUTPUT"
-
-      - name: Detect Android Gradle projects
-        id: detect
+      - name: Find APK
         shell: bash
         run: |
-          set -euo pipefail
+          set -euxo pipefail
 
-          ROOT="${{ steps.extract.outputs.extract_root }}"
-          LIST="$GITHUB_WORKSPACE/android-projects.txt"
-          : > "$LIST"
+          APK_PATH="$(find "$PROJECT_DIR" -type f -path '*/build/outputs/apk/debug/*.apk' | head -1)"
+          test -n "$APK_PATH"
 
-          # A project root normally has settings.gradle/settings.gradle.kts.
-          while IFS= read -r -d '' settings; do
-            dir="$(dirname "$settings")"
+          echo "APK_PATH=$APK_PATH" >> "$GITHUB_ENV"
+          echo "APK found: $APK_PATH"
 
-            # Require at least one Android module build file nearby.
-            if find "$dir" -maxdepth 3 -type f \
-              \( -name 'build.gradle' -o -name 'build.gradle.kts' \) \
-              -print0 | xargs -0 -r grep -lE \
-              'com\.android\.(application|library)|id[[:space:]]*\([[:space:]]*["'"']com\.android\.(application|library)' \
-              >/dev/null 2>&1; then
-              printf '%s\n' "$dir" >> "$LIST"
-            fi
-          done < <(find "$ROOT" -type f \( -name 'settings.gradle' -o -name 'settings.gradle.kts' \) -print0)
-
-          sort -u -o "$LIST" "$LIST"
-
-          if [ ! -s "$LIST" ]; then
-            echo "No Android Gradle project was detected after extracting ZIP files."
-            echo "Expected settings.gradle(.kts) and an Android module build.gradle(.kts)."
-            echo "Extracted tree (first 250 entries):"
-            find "$ROOT" -maxdepth 6 -print | head -250
-            exit 1
-          fi
-
-          echo "Detected Android project root(s):"
-          cat "$LIST"
-          echo "project_list=$LIST" >> "$GITHUB_OUTPUT"
-
-      - name: Build every detected Android project
-        shell: bash
-        env:
-          PROJECT_LIST: ${{ steps.detect.outputs.project_list }}
-        run: |
-          set -euo pipefail
-
-          ARTIFACT_ROOT="$GITHUB_WORKSPACE/_built_apks"
-          mkdir -p "$ARTIFACT_ROOT"
-
-          count=0
-          while IFS= read -r project; do
-            [ -z "$project" ] && continue
-            count=$((count+1))
-            echo "============================================================"
-            echo "Building Android project #$count: $project"
-            echo "============================================================"
-
-            cd "$project"
-
-            if [ -f gradlew ]; then
-              chmod +x gradlew
-              BUILD_CMD=(./gradlew)
-            else
-              BUILD_CMD=(gradle)
-            fi
-
-            # Prefer app:assembleDebug when an app module exists; otherwise
-            # assembleDebug lets Gradle build all Android application modules.
-            if [ -d app ] && { [ -f app/build.gradle ] || [ -f app/build.gradle.kts ]; }; then
-              "${BUILD_CMD[@]}" :app:assembleDebug --stacktrace --no-daemon
-            else
-              "${BUILD_CMD[@]}" assembleDebug --stacktrace --no-daemon
-            fi
-
-            safe="project_${count}_$(basename "$project" | tr -cs 'A-Za-z0-9._-' '_')"
-            out="$ARTIFACT_ROOT/$safe"
-            mkdir -p "$out"
-
-            # Collect APKs but exclude AndroidTest APKs.
-            while IFS= read -r -d '' apk; do
-              case "$apk" in
-                *androidTest*|*test.apk) continue ;;
-              esac
-              cp "$apk" "$out/$(basename "$apk")"
-              echo "Collected APK: $apk"
-            done < <(find "$project" -type f -path '*/build/outputs/apk/*' -name '*.apk' -print0)
-
-            cd "$GITHUB_WORKSPACE"
-          done < "$PROJECT_LIST"
-
-          if ! find "$ARTIFACT_ROOT" -type f -name '*.apk' -print -quit | grep -q .; then
-            echo "Gradle finished, but no APK file was found."
-            exit 1
-          fi
-
-          echo "All generated APKs:"
-          find "$ARTIFACT_ROOT" -type f -name '*.apk' -print
-
-      - name: Upload all APKs
+      - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: Android-APKs
-          path: _built_apks/**/*.apk
+          name: X-Dubbing-Studio-v2-debug-APK
+          path: ${{ env.APK_PATH }}
           if-no-files-found: error
-          retention-days: 14
-          
