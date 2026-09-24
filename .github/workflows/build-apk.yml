@@ -16,45 +16,101 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 35
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - uses: actions/setup-java@v4
+      - name: Java 17
+        uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
 
-      - uses: android-actions/setup-android@v3
+      # IMPORTANT: v3 became broken when Google stopped serving the old
+      # Android SDK "tools" package. v4 defaults to supported cmdline-tools.
+      - name: Android SDK command line tools
+        uses: android-actions/setup-android@v4
+        with:
+          packages: 'platform-tools'
 
       - name: Android SDK 35
-        run: |
-          yes | sdkmanager --licenses >/dev/null || true
-          sdkmanager "platforms;android-35" "build-tools;35.0.0"
-
-      - uses: gradle/actions/setup-gradle@v4
-        with:
-          gradle-version: '8.9'
-
-      - name: Find newest committed ZIP and extract
         shell: bash
         run: |
           set -euo pipefail
-          best=""; best_ts=0
+          sdkmanager --install "platforms;android-35" "build-tools;35.0.0"
+
+      - name: Gradle 8.9
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      - name: Find newest committed ZIP and extract nested source
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          best=""
+          best_ts=0
           while IFS= read -r -d '' f; do
             ts=$(git log -1 --format=%ct -- "$f" 2>/dev/null || echo 0)
-            if [ "$ts" -ge "$best_ts" ]; then best_ts="$ts"; best="$f"; fi
-          done < <(find . -type f -iname '*.zip' -print0)
-          if [ -z "$best" ]; then echo "No ZIP found"; exit 1; fi
-          echo "Using $best"
-          rm -rf build_source && mkdir build_source
-          unzip -q "$best" -d build_source
-          project=$(find build_source -type f \( -name settings.gradle -o -name settings.gradle.kts \) -printf '%h\n' | head -1)
-          if [ -z "$project" ]; then echo "No Android Gradle project found"; exit 1; fi
+            if [ "$ts" -ge "$best_ts" ]; then
+              best_ts="$ts"
+              best="$f"
+            fi
+          done < <(find . -type f -iname '*.zip' -not -path './build_source/*' -print0)
+
+          if [ -z "$best" ]; then
+            echo "No committed ZIP found"
+            exit 1
+          fi
+          echo "Using OneClick ZIP: $best"
+
+          rm -rf build_source
+          mkdir -p build_source/layer0
+          unzip -q "$best" -d build_source/layer0
+
+          search_root="build_source/layer0"
+          project=""
+
+          # Support both styles:
+          # 1) ZIP contains Android source directly.
+          # 2) OneClick ZIP contains a nested *FULL_SOURCE.zip.
+          for depth in 0 1 2 3; do
+            project=$(find "$search_root" -type f \( -name settings.gradle -o -name settings.gradle.kts \) -printf '%h\n' | head -1 || true)
+            if [ -n "$project" ]; then
+              break
+            fi
+
+            nested=$(find "$search_root" -type f -iname '*FULL_SOURCE.zip' | head -1 || true)
+            if [ -z "$nested" ]; then
+              nested=$(find "$search_root" -type f -iname '*.zip' | head -1 || true)
+            fi
+            if [ -z "$nested" ]; then
+              break
+            fi
+
+            next="build_source/layer$((depth+1))"
+            rm -rf "$next"
+            mkdir -p "$next"
+            echo "Extracting nested ZIP: $nested"
+            unzip -q "$nested" -d "$next"
+            search_root="$next"
+          done
+
+          if [ -z "$project" ]; then
+            echo "No Android Gradle project found after nested ZIP extraction"
+            find build_source -maxdepth 4 -type f | sort | head -200
+            exit 1
+          fi
+
+          echo "Android project: $project"
           echo "PROJECT_DIR=$project" >> "$GITHUB_ENV"
 
       - name: Build APK
+        shell: bash
         run: |
+          set -euo pipefail
           cd "$PROJECT_DIR"
           gradle --no-daemon --stacktrace :app:assembleDebug
 
@@ -68,7 +124,8 @@ jobs:
           cp "$apk" release/LinguaMentor-latest.apk
           sha256sum release/LinguaMentor-latest.apk > release/SHA256.txt
 
-      - uses: actions/upload-artifact@v4
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
         with:
           name: LinguaMentor-APK
           path: release/*
